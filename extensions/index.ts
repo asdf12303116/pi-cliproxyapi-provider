@@ -58,6 +58,7 @@ import {
 	resolvePauseDefault,
 	saveConfigFile,
 } from "./lib.ts";
+import { ModelCatalogController } from "./model-refresh.ts";
 import type { PauseController } from "./pause.ts";
 import { pauseController, waitForPauseToEnd } from "./pause.ts";
 import { registerTransientNetworkErrorRetry } from "./retry.ts";
@@ -193,6 +194,13 @@ function logInfo(message: string): void {
 
 const COMPAT_COORDINATOR_KEY = Symbol.for("pi-cliproxyapi-provider.compat-coordinator");
 export const COMPAT_SOURCE_ID = "pi-cliproxyapi-provider-global";
+
+/**
+ * Pi-native model refresh seam (from upstream PR #22). Assigned by the default
+ * export so every registerProvider call exposes the same `refreshModels`
+ * callback to Pi's model registry.
+ */
+let catalogController: ModelCatalogController | undefined;
 
 interface CompatRegistrationEntry {
 	instanceId: string;
@@ -542,6 +550,7 @@ function registerProvider(
 		oauth,
 		...(apiKey ? { apiKey } : {}),
 		...(models && models.length > 0 ? { models } : {}),
+		...(catalogController ? { refreshModels: catalogController.refreshModels } : {}),
 	});
 }
 
@@ -918,8 +927,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}, DEFAULT_AUTO_RECOVERY_DELAY_MS);
 	};
 
-	const handleRefreshOutcome = (loaded: MappedModels): void => {
-		const staleModels = loaded.models.filter((m) => m.stale);
+	const handleCatalogUpdate = (models: PiProviderModel[]): void => {
+		const staleModels = models.filter((m) => m.stale);
 		latestStaleModelIds = staleModels.map((m) => m.id);
 
 		if (staleModels.length > 0) {
@@ -932,6 +941,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			modelRefreshCoordinator.clearRecovery();
 		}
 	};
+
+	const handleRefreshOutcome = (loaded: MappedModels): void => handleCatalogUpdate(loaded.models);
+
+	// Pi-native refresh seam (upstream PR #22): Pi-initiated refreshes reuse the
+	// same mapped-model pipeline and stale-model bookkeeping as the extension's
+	// own startup, /fast, and /cliproxyapi-refresh paths.
+	catalogController = new ModelCatalogController(
+		agentDir,
+		fastMode,
+		() => resolveConnection(agentDir, identity.providerId),
+		handleCatalogUpdate,
+	);
 
 	// Always register oauth so the provider is visible in /login immediately after install.
 	registerProvider(pi, {

@@ -203,14 +203,27 @@ From CPA catalog entry → pi model:
 | ----------- | ---------- |
 | `slug` | `id` |
 | `display_name` | `name` |
-| `context_window` | `contextWindow` |
+| `context_window` / `max_context_window` | `contextWindow` |
+| `max_tokens` / `max_output_tokens` / `max_completion_tokens` | `maxTokens` |
 | `input_modalities` | `input` (`text` / `image`) |
 | `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
 | `visibility: "hide"` | skipped |
 
-Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
+Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices and capabilities are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
 
-The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+Context window and max output tokens are resolved with one fail-closed priority order:
+
+1. Positive `context_window` / `max_context_window` and `max_tokens` / `max_output_tokens` / `max_completion_tokens` returned by CLIProxyAPI.
+2. Exact canonical metadata (or a documented alias) from `models.dev`.
+3. Conservative defaults: 128,000 context and 16,384 max output.
+
+CLIProxyAPI's generated catalog can assign both context fields the same generic 272,000-token template. That pair is not treated as an explicit limit: an exact canonical match replaces it (for example `kimi-k3` → 1,048,576 context), while an unknown model falls back conservatively. The 272,000 value is retained only when the canonical entry publishes a matching 272,000 context price tier, preserving intentionally constrained models such as the GPT-5.6 short-context tier. Matching is exact/alias-based only; there is no fuzzy lookup.
+
+Replayed Responses history is normalized before every request: duplicate tool-call identities from long sessions (for example Kimi K3) are deterministically suffixed so each `function_call` / `function_call_output` pair stays unique and paired.
+
+The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, capabilities use the server's trusted explicit values or conservative defaults, while pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+
+The provider also exposes Pi's native `refreshModels` lifecycle, so refreshes initiated by Pi's model registry resolve canonical capabilities and pricing through the same mapped-model pipeline and stale-model bookkeeping as startup, `/fast`, and `/cliproxyapi-refresh`.
 
 ## Migration from static models.json
 
@@ -243,3 +256,19 @@ Disable just this helper via `pi config` if you only want the CLIProxyAPI provid
 - If CPA returns HTTP 200 with zero usable models: login still succeeds; re-run `/login CLIProxyAPI` later after models become available.
 - If the selected model does not provide a non-empty `service_tiers` array: the request is left unchanged; `/fast` still updates the global preference and warns when enabling it.
 - After `/compact`, threshold compaction, or overflow recovery, the provider closes the reused Codex WebSocket for the current session. CLIProxyAPI binds server-side context to the connection, so a reused socket would keep reporting a near-full `cacheRead` and retrigger proactive compaction even though the client context is now small. SSE is unaffected because it bills from the request body.
+
+## Fork patches and upstream sync
+
+This repository is a fork of [router-for-me/pi-cliproxyapi-provider](https://github.com/router-for-me/pi-cliproxyapi-provider). `main` stays a thin layer on top of upstream so it can be re-synced automatically.
+
+Local patches carried on top of upstream `main`:
+
+- **PR #15** (`fix(models): derive maxTokens from model metadata`) is **already upstream** (commit `7260b5a`), so no local patch is needed.
+- **PR #22** (`Resolve dynamic model context and output capabilities`) is re-implemented on the latest upstream rather than merged literally, because it was authored before the pi ≥0.86 TranscriptContext, Codex WebSocket, and stale-model work landed upstream. Carried forward from PR #22:
+  - canonical `models.dev` context/output capability resolution (`limit.context` / `limit.output`) with the fail-closed priority order documented above;
+  - deterministic tool-call identity normalization for replayed Responses history;
+  - Pi's native `refreshModels` lifecycle exposed on the provider registration, sharing the extension's mapped-model pipeline and stale-model bookkeeping.
+
+Everything else — startup/background refresh, `/fast`, `/cliproxyapi-refresh`, auto-recovery, and stale-model notifications — remains upstream's implementation.
+
+A scheduled workflow (`.github/workflows/sync-upstream.yml`) merges `upstream/main` weekly, runs `npm run check`, and pushes when the merge is clean. Conflicts open (or update) a tracking issue instead, so the patch layer can be rebased by hand.

@@ -193,6 +193,107 @@ export function adaptContextForModule(
 	return supportsTranscript ? ensureTranscriptContext(context) : adaptTranscriptContext(context);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function allocateDuplicateIdentity(
+	original: string,
+	ordinal: number,
+	reserved: ReadonlySet<string>,
+	allocated: Set<string>,
+): string {
+	let candidateOrdinal = ordinal;
+	while (true) {
+		const suffix = `_pi_${candidateOrdinal}`;
+		const candidate = `${original.slice(0, 64 - suffix.length)}${suffix}`;
+		if (!reserved.has(candidate) && !allocated.has(candidate)) {
+			allocated.add(candidate);
+			return candidate;
+		}
+		candidateOrdinal++;
+	}
+}
+
+/**
+ * Make replayed Responses function-call identities unique while preserving each
+ * call/output pair. Upstream conversion has already flattened history here, so
+ * sequential pairing also covers synthetic outputs inserted for adjacent calls.
+ *
+ * Long CLIProxyAPI sessions (for example Kimi K3) can replay the same tool call
+ * id twice, which the Responses API rejects. Renaming only the duplicates keeps
+ * ids stable and deterministic across retries.
+ */
+export function normalizeResponsesToolCallIdentities(payload: unknown): unknown {
+	if (!isRecord(payload) || !Array.isArray(payload.input)) {
+		return payload;
+	}
+
+	const input = payload.input;
+	const reservedCallIds = new Set<string>();
+	const reservedItemIds = new Set<string>();
+	for (const item of input) {
+		if (!isRecord(item) || item.type !== "function_call") continue;
+		if (typeof item.call_id === "string") reservedCallIds.add(item.call_id);
+		if (typeof item.id === "string") reservedItemIds.add(item.id);
+	}
+
+	const callOccurrences = new Map<string, number>();
+	const itemOccurrences = new Map<string, number>();
+	const allocatedCallIds = new Set<string>();
+	const allocatedItemIds = new Set<string>();
+	const pendingCallIds = new Map<string, string[]>();
+	let changed = false;
+
+	const normalizedInput = input.map((item): unknown => {
+		if (!isRecord(item)) return item;
+
+		if (item.type === "function_call") {
+			const originalCallId = item.call_id;
+			const originalItemId = item.id;
+			let callId = originalCallId;
+			let itemId = originalItemId;
+
+			if (typeof originalCallId === "string") {
+				const ordinal = (callOccurrences.get(originalCallId) ?? 0) + 1;
+				callOccurrences.set(originalCallId, ordinal);
+				const pairedCallId =
+					ordinal === 1
+						? originalCallId
+						: allocateDuplicateIdentity(originalCallId, ordinal, reservedCallIds, allocatedCallIds);
+				callId = pairedCallId;
+				const pending = pendingCallIds.get(originalCallId) ?? [];
+				pending.push(pairedCallId);
+				pendingCallIds.set(originalCallId, pending);
+			}
+
+			if (typeof originalItemId === "string") {
+				const ordinal = (itemOccurrences.get(originalItemId) ?? 0) + 1;
+				itemOccurrences.set(originalItemId, ordinal);
+				if (ordinal > 1) {
+					itemId = allocateDuplicateIdentity(originalItemId, ordinal, reservedItemIds, allocatedItemIds);
+				}
+			}
+
+			if (callId === originalCallId && itemId === originalItemId) return item;
+			changed = true;
+			return { ...item, call_id: callId, id: itemId };
+		}
+
+		if (item.type === "function_call_output" && typeof item.call_id === "string") {
+			const callId = pendingCallIds.get(item.call_id)?.shift();
+			if (callId !== undefined && callId !== item.call_id) {
+				changed = true;
+				return { ...item, call_id: callId };
+			}
+		}
+
+		return item;
+	});
+
+	return changed ? { ...payload, input: normalizedInput } : payload;
+}
+
 export function withPriorityServiceTier(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
@@ -209,24 +310,33 @@ export async function applyFastPayloadHook(
 	model: Model<Api>,
 	onPayload?: PayloadHook,
 ): Promise<unknown> {
-	const fastPayload = withPriorityServiceTier(payload);
+	const normalizedPayload = normalizeResponsesToolCallIdentities(payload);
+	const fastPayload = withPriorityServiceTier(normalizedPayload);
 	const nextPayload = await onPayload?.(fastPayload, model);
 	return nextPayload === undefined ? fastPayload : nextPayload;
 }
 
+/**
+ * Always normalize replayed tool-call identities, and apply Fast on top when
+ * the model supports it. Normalization runs before user payload hooks so later
+ * extensions retain final control over the payload.
+ */
 export function wrapStreamSimpleForFast(
 	streamSimple: CliproxyCodexStreamSimple,
 	shouldUseFast?: (model: Model<Api>) => boolean,
 ): CliproxyCodexStreamSimple {
-	return (model, context, streamOptions) => {
-		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, context, streamOptions);
-		}
-		return streamSimple(model, context, {
+	return (model, context, streamOptions) =>
+		streamSimple(model, context, {
 			...streamOptions,
-			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
+			onPayload: async (payload, payloadModel) => {
+				if (shouldUseFast?.(model)) {
+					return applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload);
+				}
+				const normalizedPayload = normalizeResponsesToolCallIdentities(payload);
+				const nextPayload = await streamOptions?.onPayload?.(normalizedPayload, payloadModel);
+				return nextPayload === undefined ? normalizedPayload : nextPayload;
+			},
 		});
-	};
 }
 
 const EXTRACT_ACCOUNT_ID_PATCH = `function extractAccountId(token) {

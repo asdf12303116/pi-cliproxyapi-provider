@@ -416,7 +416,7 @@ describe("Fast pricing mapping", () => {
 });
 
 describe("Fast stream wrapper", () => {
-	it("passes options through unchanged when Fast is not effective", () => {
+	it("preserves timeout options and normalizes payloads when Fast is not effective", async () => {
 		let captured: SimpleStreamOptions | undefined;
 		const streamResult = {} as ReturnType<CliproxyCodexStreamSimple>;
 		const baseStream: CliproxyCodexStreamSimple = (_model, _context, options) => {
@@ -427,7 +427,11 @@ describe("Fast stream wrapper", () => {
 		const options: SimpleStreamOptions = { timeoutMs: 1234 };
 
 		expect(wrapped(model, { messages: [] }, options)).toBe(streamResult);
-		expect(captured).toBe(options);
+		expect(captured?.timeoutMs).toBe(1234);
+		// Tool-call identity normalization always wraps the payload hook, even
+		// when Fast is not effective.
+		const payload = { model: "gpt-5.4", input: [] };
+		expect(await captured?.onPayload?.(payload, model)).toBe(payload);
 	});
 
 	it("preserves stream options and composes the Fast payload hook when enabled", async () => {
