@@ -161,6 +161,29 @@ describe("canonical model capability resolution", () => {
 		});
 	});
 
+	it("resolves deepseek-v4.1-flash from the official deepseek-v4-flash entry instead of ambiguous resellers", async () => {
+		const canonical = await catalog({
+			deepseek: {
+				models: {
+					// Official rolling id for the latest V4.1 Flash.
+					"deepseek-v4-flash": { limit: { context: 1_000_000, output: 393_216 } },
+					// Decoy: must not be selected by the alias.
+					"deepseek-flash": { limit: { context: 500_000, output: 1_000 } },
+				},
+			},
+			// Conflicting reseller entries for the same stripped id must not win either.
+			aihubmix: { models: { "deepseek-v4.1-flash": { limit: { context: 1_000_000, output: 384_000 } } } },
+			hyper: { models: { "deepseek-v4.1-flash": { limit: { context: 1_048_576, output: 32_768 } } } },
+		});
+
+		const model = toPiModel(
+			{ slug: "deepseek-v4.1-flash", context_window: 272_000, max_context_window: 272_000 },
+			canonical,
+		);
+
+		expect(model).toMatchObject({ contextWindow: 1_000_000, maxTokens: 393_216 });
+	});
+
 	it("fails closed for unknown models and does not trust the 272K template", async () => {
 		const canonical = await catalog({
 			moonshotai: {

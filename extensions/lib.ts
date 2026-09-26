@@ -649,6 +649,12 @@ const MODEL_CANONICAL_ALIASES: Record<string, string[]> = {
 	"gemini-3-flash-agent": ["gemini-3.5-flash"],
 	"grok-composer-2.5-fast": ["grok-4.3"],
 	"grok-3-mini": ["xai/grok-3-mini"],
+	// The proxy renames DeepSeek's latest V4.1 Flash as `deepseek-v4.1-flash`, while
+	// models.dev's official `deepseek` provider still publishes that latest version
+	// under its rolling id `deepseek-v4-flash` (same 1,000,000 / 393,216 limits and
+	// pricing as the `deepseek-flash` alias). The stripped proxy id is claimed by
+	// 30 conflicting reseller entries, so pin the official entry.
+	"deepseek-v4.1-flash": ["deepseek/deepseek-v4-flash"],
 };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
