@@ -1,0 +1,121 @@
+name: Sync upstream
+
+# Keeps this fork current with router-for-me/pi-cliproxyapi-provider.
+#
+# - Merges upstream/main into main.
+# - Runs `npm run check` on the merged tree.
+# - Pushes only when the merge and checks are clean.
+# - Opens (or comments on) a tracking issue when a merge conflict or a failing
+#   check needs a manual rebase of the local patch layer.
+#
+# Pushes made with GITHUB_TOKEN do not retrigger workflows, so this cannot loop.
+
+on:
+  schedule:
+    # Every Monday at 03:17 UTC.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git and remotes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/router-for-me/pi-cliproxyapi-provider.git
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+          if git merge --no-edit upstream/main; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+            echo "Merged upstream/main cleanly."
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "Merge conflict against upstream/main."
+          fi
+
+      - name: Set up Node.js
+        if: steps.merge.outputs.status == 'merged'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.merge.outputs.status == 'merged'
+        run: npm ci
+
+      - name: Run checks
+        id: check
+        if: steps.merge.outputs.status == 'merged'
+        run: npm run check
+
+      - name: Push merged main
+        if: steps.merge.outputs.status == 'merged' && steps.check.outcome == 'success'
+        run: git push origin HEAD:main
+
+      - name: Report sync problem
+        if: failure() || steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync needs attention"
+          if [ "${{ steps.merge.outputs.status }}" = "conflict" ]; then
+            reason="a merge conflict"
+          else
+            reason="a failing npm run check on the merged tree"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body=$(printf '%s\n' \
+            "The scheduled upstream sync could not complete automatically because of ${reason}." \
+            "" \
+            "- Workflow run: ${run_url}" \
+            "- Fork branch: main" \
+            "- Upstream: router-for-me/pi-cliproxyapi-provider@main (fetched during this run)" \
+            "" \
+            "To resolve it locally:" \
+            "" \
+            '```sh' \
+            "git fetch upstream main" \
+            "git checkout main" \
+            "git merge upstream/main" \
+            "# resolve conflicts, keeping the local patch layer documented in README.md" \
+            "npm ci && npm run check" \
+            "git push origin main" \
+            '```' \
+            "" \
+            "Close this issue once main includes the upstream changes and checks pass.")
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
