@@ -13,10 +13,10 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createRequire, isBuiltin } from "node:module";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 
@@ -399,6 +399,57 @@ export function wellKnownCodexModuleCandidates(homeDirectory: string): string[] 
 			"pi-coding-agent",
 			CODEX_MODULE_RELATIVE,
 		),
+		join(homeDirectory, ".bun", "install", "global", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".bun",
+			"install",
+			"global",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join(homeDirectory, ".npm-global", CODEX_MODULE_RELATIVE),
+		join(homeDirectory, ".npm-global", "lib", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".npm-global",
+			"lib",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join(homeDirectory, "Library", "pnpm", "global", "5", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			"Library",
+			"pnpm",
+			"global",
+			"5",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join(homeDirectory, ".local", "share", "pnpm", "global", "5", CODEX_MODULE_RELATIVE),
+		join(
+			homeDirectory,
+			".local",
+			"share",
+			"pnpm",
+			"global",
+			"5",
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+			CODEX_MODULE_RELATIVE,
+		),
+		join("/usr", "local", "lib", CODEX_MODULE_RELATIVE),
+		join("/usr", "local", "lib", "node_modules", "@earendil-works", "pi-coding-agent", CODEX_MODULE_RELATIVE),
+		join("/opt", "homebrew", "lib", CODEX_MODULE_RELATIVE),
+		join("/opt", "homebrew", "lib", "node_modules", "@earendil-works", "pi-coding-agent", CODEX_MODULE_RELATIVE),
 	];
 }
 
@@ -553,16 +604,54 @@ export function patchCodexSource(source: string, providerIds: string[]): string 
 }
 
 export function resolveCodexModuleFromNodeEntry(entryPath: string): string | undefined {
-	try {
-		const require = createRequire(pathToFileURL(realpathSync(entryPath)));
-		for (const nodeModulesDir of require.resolve.paths("@earendil-works/pi-ai") ?? []) {
-			const candidate = join(nodeModulesDir, "@earendil-works", "pi-ai", "dist", "api", "openai-codex-responses.js");
-			if (existsSync(candidate)) {
-				return candidate;
+	const visited = new Set<string>();
+	const queue = [entryPath];
+
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (!current || visited.has(current)) continue;
+		visited.add(current);
+
+		try {
+			if (!existsSync(current)) continue;
+			const real = realpathSync(current);
+			const require = createRequire(pathToFileURL(real));
+			for (const nodeModulesDir of require.resolve.paths("@earendil-works/pi-ai") ?? []) {
+				const candidate = join(
+					nodeModulesDir,
+					"@earendil-works",
+					"pi-ai",
+					"dist",
+					"api",
+					"openai-codex-responses.js",
+				);
+				if (existsSync(candidate)) {
+					return candidate;
+				}
 			}
+
+			// If current is a small text script (wrapper / trampoline), inspect it for referenced entry paths or imports
+			if (statSync(real).size < 8192) {
+				const content = readFileSync(real, "utf8");
+				// Look for path-like string literals (e.g. "/foo/bar", "./cli.js", "../dist/cli.js")
+				const pathMatches = content.matchAll(/["'`]((\/|[A-Za-z]:[\\/]|\.{1,2}[\\/])[^"'`\r\n]+)["'`]/g);
+				for (const match of pathMatches) {
+					const ref = match[1]?.trim();
+					if (ref) {
+						queue.push(resolve(dirname(real), ref));
+					}
+				}
+				const homeJoinMatch = content.match(
+					/join\s*\(\s*(?:homedir\(\)|process\.env\.HOME)[^)]*["']([^"']+)["']\s*\)/,
+				);
+				if (homeJoinMatch) {
+					const home = process.env.HOME || process.env.USERPROFILE || homedir();
+					queue.push(join(home, homeJoinMatch[1]));
+				}
+			}
+		} catch {
+			// Ignore invalid or unavailable runtime entrypoints.
 		}
-	} catch {
-		// Ignore invalid or unavailable runtime entrypoints.
 	}
 	return undefined;
 }
@@ -621,6 +710,25 @@ export function resolveOriginalCodexModulePath(options: ResolveOriginalCodexModu
 		const bundledHostModule = resolveCodexModuleFromNodeEntry(nodeEntry);
 		if (bundledHostModule && existsSync(bundledHostModule)) {
 			return { path: bundledHostModule, dir: dirname(bundledHostModule) };
+		}
+	}
+
+	// Also check well-known CLI binaries if nodeEntry wasn't explicitly provided in options
+	if (!("nodeEntry" in options) && homeDirectory) {
+		const wellKnownEntries = [
+			join(homeDirectory, ".bun", "bin", "pi"),
+			join(homeDirectory, ".local", "bin", "pi"),
+			join(homeDirectory, ".npm-global", "bin", "pi"),
+			"/usr/local/bin/pi",
+			"/opt/homebrew/bin/pi",
+		];
+		for (const entry of wellKnownEntries) {
+			if (entry !== nodeEntry && existsSync(entry)) {
+				const bundledHostModule = resolveCodexModuleFromNodeEntry(entry);
+				if (bundledHostModule && existsSync(bundledHostModule)) {
+					return { path: bundledHostModule, dir: dirname(bundledHostModule) };
+				}
+			}
 		}
 	}
 
