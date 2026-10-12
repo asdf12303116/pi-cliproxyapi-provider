@@ -185,7 +185,9 @@ describe("resolveOriginalCodexModulePath", () => {
 
 		const resolved = resolveOriginalCodexModulePath({ homeDirectory: home, nodeEntry: undefined });
 		expect(resolved.path).not.toBe(join(home, ".omp", "plugins", CODEX_RELATIVE));
-		expect(resolved.path).toMatch(/node_modules\/@earendil-works\/pi-ai\/dist\/api\/openai-codex-responses\.js$/);
+		expect(resolved.path).toMatch(
+			/[\\/]node_modules[\\/]@earendil-works[\\/]pi-ai[\\/]dist[\\/]api[\\/]openai-codex-responses\.js$/,
+		);
 	});
 
 	it("resolves a HOME/.omp/plugins candidate when import.meta.resolve fails and argv is a Mach-O host", () => {
@@ -371,8 +373,8 @@ export function registerHook(fn) { registerCleanup(fn); }
 		const sourceB = readFileSync(outPathB, "utf8");
 
 		expect(sourceA).not.toBe(sourceB);
-		expect(sourceA).toContain(homeA);
-		expect(sourceB).toContain(homeB);
+		expect(sourceA).toContain(pathToFileURL(homeA).href);
+		expect(sourceB).toContain(pathToFileURL(homeB).href);
 
 		// Removing install A does not affect install B
 		rmSync(homeA, { recursive: true, force: true });
